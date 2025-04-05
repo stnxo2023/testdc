@@ -576,9 +576,13 @@ class CS16BandwidthTester:
             self._decrement_counter("active_workers_count")
             conn_info["status"] = "stopped"
             sock = conn_info.get("socket") # Close UDP socket if exists
+            # --- CORRECTED SYNTAX ---
             if sock:
-                try: sock.close()
-                except Exception: pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass # Silently ignore errors during socket close in finally block
+            # --- END CORRECTION ---
             if self.verbose: logger.debug(f"Worker {conn_id}: Finished (Mode={mode}).")
 
     def _get_file_to_download_http(self):
@@ -830,9 +834,10 @@ class CS16BandwidthTester:
         self.http_session.close()
         for conn_info in self.connections: # Close any remaining UDP sockets
              sock = conn_info.get("socket")
-             if sock: 
-                 try: sock.close()
-             except Exception: 
+             if sock:
+                 try:
+                     sock.close()
+                 except Exception:
                     pass
         # Close log file handler
         self._close_activity_logger()
@@ -921,8 +926,11 @@ def signal_handler(sig, frame):
         print('\nCtrl+C received, exiting immediately.')
         # Attempt to close log file even if tester not fully active
         handler = next((h for h in activity_logger.handlers if isinstance(h, logging.FileHandler)), None)
-        if handler: try: handler.close()
-        except: pass
+        if handler:
+            try:
+                handler.close()
+            except Exception:
+                pass
         sys.exit(0)
 
 # ==============================================================
@@ -966,7 +974,7 @@ if __name__ == "__main__":
             except OSError as e: logger.warning(f"Cannot create storage dir '{args.storage_dir}'.")
 
         tester_instance = CS16BandwidthTester(
-            server_ip=args.server_ip, port=args.port, num_connections=args.connections,
+            server_ip=args.server_ip, server_port=args.port, num_connections=args.connections, # Fixed typo server_port
             test_duration=args.duration, download_delay=args.delay, verbose=args.verbose,
             storage_dir=args.storage_dir, continuous_mode=args.continuous,
             no_server_monitor=args.no_server_monitor, fastdl_url=args.fastdl_url,
@@ -981,5 +989,8 @@ if __name__ == "__main__":
     except Exception as e: logger.error(f"An critical error occurred: {e}", exc_info=True); sys.exit(1)
     finally: # Ensure log file handler is closed on unexpected exit
         handler = next((h for h in activity_logger.handlers if isinstance(h, logging.FileHandler)), None)
-        if handler: try: handler.close()
-        except: pass
+        if handler:
+            try:
+                handler.close()
+            except Exception:
+                pass
