@@ -10,59 +10,70 @@ import collections
 import argparse
 import sys
 import signal
+import requests # <--- Added for HTTP downloads
+import shutil # <--- For potential file operations (if needed later)
 from datetime import datetime
-import requests # <--- Added: For HTTP downloads
-from urllib.parse import urljoin # <--- Added: For constructing URLs safely
+from urllib.parse import urljoin, urlparse # <--- To handle URLs
 
 # --- Constants ---
 DEFAULT_PORT = 27015
 HIGH_PING_THRESHOLD = 150 # ms
 SERVER_OFFLINE_TIMEOUT = 15 # seconds without response
-LAST_FILES_DISPLAY_COUNT = 5 # How many recent filenames/URLs to show in UI
+LAST_FILES_DISPLAY_COUNT = 10 # Show more files now
 UI_UPDATE_INTERVAL = 0.5 # How often to refresh the terminal stats (seconds)
-CONNECTION_CHECK_INTERVAL = 2.0 # How often worker status is checked (less critical now)
-HTTP_TIMEOUT = 15 # seconds for HTTP connection/read
-DOWNLOAD_LOG_FILENAME = "download_log.txt" # Name for the download details log file
-
-# For simulation fallback
-CS_FILE_REQUESTS = [
-    b"\xff\xff\xff\xffgetinfo\x00", b"\xff\xff\xff\xffgetstatus\x00",
-    b"\xff\xff\xff\xffrcon", b"\xff\xff\xff\xffping\x00",
-    b"\xff\xff\xff\xffdetails\x00", b"\xff\xff\xff\xffplayers\x00",
-    b"\xff\xff\xff\xffrules\x00", b"\xff\xff\xff\xffchallenge\x00",
-]
-DOWNLOAD_SIZES = { "map": 20*1024*1024, "model": 2*1024*1024, "sound": 512*1024, "sprite": 128*1024, "texture": 1*1024*1024 }
+REQUEST_TIMEOUT = 10 # Timeout for HTTP requests (seconds)
+DOWNLOAD_CHUNK_SIZE = 8192 # Bytes to download per chunk
 
 # --- Global logger setup ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s',
     datefmt='%H:%M:%S',
-    stream=sys.stderr # Log messages go to stderr, stats go to stdout
+    stream=sys.stderr
 )
-logger = logging.getLogger('cs_bandwidth_tester_cli')
+logger = logging.getLogger('cs_real_downloader_cli')
 
-# --- Download Logger Setup ---
-# Separately log download attempts/results to a file
-download_logger = logging.getLogger('download_logger')
-download_logger.setLevel(logging.INFO)
-download_logger.propagate = False # Prevent double logging to stderr
+# --- Dedicated Download Log Setup ---
+download_log_file = None
+def setup_download_logger(filename="download_attempts.log"):
+    global download_log_file
+    try:
+        # Use 'a' to append if file exists
+        download_log_file = open(filename, 'a', encoding='utf-8')
+        download_log_file.write(f"\n--- Log Start: {datetime.now().isoformat()} ---\n")
+        download_log_file.flush()
+        logger.info(f"Logging download attempts to: {filename}")
+    except Exception as e:
+        logger.error(f"Failed to open download log file '{filename}': {e}")
+        download_log_file = None
+
+def log_download_attempt(url, status, bytes_downloaded=0, message=""):
+    if download_log_file:
+        try:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            log_entry = f"{timestamp} | URL: {url} | Status: {status} | Bytes: {bytes_downloaded} | Info: {message}\n"
+            download_log_file.write(log_entry)
+            download_log_file.flush()
+        except Exception as e:
+            # Avoid crashing the main script if logging fails
+            logger.warning(f"Failed to write to download log: {e}")
 
 # Global variable to hold the tester instance for signal handling
 tester_instance = None
 
 # ==============================================================
-# ServerQuery Class (Updated to fetch rules and sv_downloadurl)
+# ServerQuery Class (Mostly unchanged, used for map name)
 # ==============================================================
 class ServerQuery:
+    # --- (Keep the ServerQuery class exactly as it was in your original script) ---
+    # ... (previous ServerQuery code omitted for brevity) ...
+    # Make sure it correctly parses the 'map' field.
     def __init__(self, server_ip, server_port=DEFAULT_PORT):
         self.server_ip = server_ip; self.server_port = server_port
         self.last_info = None; self.last_ping = 0; self.sock = None
         self.retry_count = 2; self.timeout = 1.5 # seconds
-        self.last_challenge = None # Store challenge for rules query
 
     def _create_socket(self):
-        # (Same as before)
         if self.sock is not None:
             try: self.sock.close()
             except Exception: pass
@@ -70,652 +81,403 @@ class ServerQuery:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); self.sock.settimeout(self.timeout)
         except Exception as e: logger.error(f"Query Socket Create Error: {e}"); self.sock = None; raise
 
-    def _send_recv(self, request):
-        """Helper to send a request and receive response, handling retries."""
+    def get_info(self):
         if self.sock is None:
              try: self._create_socket()
-             except Exception: return None, 0
-
-        start_time = time.time()
-        response = None
+             except Exception: return None
+        start_time = time.time(); request = b"\xFF\xFF\xFF\xFFTSource Engine Query\x00" # Standard Source query request
         for attempt in range(self.retry_count):
             try:
-                self.sock.sendto(request, (self.server_ip, self.server_port))
-                response, _ = self.sock.recvfrom(4096) # Might need larger buffer for rules?
-                end_time = time.time()
-                ping = int((end_time - start_time) * 1000)
+                self.sock.sendto(request, (self.server_ip, self.server_port)); response, _ = self.sock.recvfrom(4096)
+                end_time = time.time(); self.last_ping = int((end_time - start_time) * 1000)
                 if response:
-                    return response, ping
+                    parsed_info = self._parse_info(response)
+                    if parsed_info:
+                        self.last_info = parsed_info; return parsed_info
+                    else:
+                        logger.debug(f"Failed to parse server response (attempt {attempt+1}). Response: {response[:100]}...") # Log start of response
                 else:
-                    logger.debug(f"Received empty response (attempt {attempt+1}) for request: {request[:20]}")
+                    logger.debug(f"Received empty response (attempt {attempt+1})")
+
             except socket.timeout:
-                logger.debug(f"Server query timed out (attempt {attempt+1}) for request: {request[:20]}")
-                if attempt == self.retry_count - 1: return None, 0 # Return None after final timeout
+                logger.debug(f"Server query timed out (attempt {attempt+1})")
+                if attempt == self.retry_count - 1: return None # Return None after final timeout
                 time.sleep(0.1) # Wait briefly before retry
-            except (OSError) as e:
-                logger.warning(f"Query Send/Recv Error (attempt {attempt+1}): {type(e).__name__} - {str(e)}")
+            except (OSError, ValueError) as e: # ValueError might be raised by parsing attempt
+                logger.warning(f"Query Error (attempt {attempt+1}): {type(e).__name__} - {str(e)}")
                 self.close() # Close potentially broken socket
-                return None, 0 # Return None on significant errors
+                return None # Return None on significant errors
             except Exception as e:
-                logger.error(f"Unexpected Query Send/Recv Error (attempt {attempt+1}): {type(e).__name__} - {str(e)}")
+                logger.error(f"Unexpected Query Error (attempt {attempt+1}): {type(e).__name__} - {str(e)}")
                 self.close()
-                return None, 0 # Return None on unexpected errors
-        return None, 0 # Explicitly return None if all retries fail
-
-    def get_info(self):
-        """Gets basic server info (A2S_INFO)."""
-        request = b"\xFF\xFF\xFF\xFFTSource Engine Query\x00" # Standard Source query request
-        response, ping = self._send_recv(request)
-        if response:
-            parsed_info = self._parse_info(response)
-            if parsed_info:
-                self.last_ping = ping # Use ping from this successful query
-                parsed_info['ping'] = self.last_ping # Add ping to the dict
-                self.last_info = parsed_info
-                # Check for challenge request needed for rules
-                if response[4:5] == b'A': # 0x41
-                    self.last_challenge = response[5:9]
-                    logger.debug(f"Received challenge: {self.last_challenge}")
-                else:
-                    self.last_challenge = None # GoldSrc or other may not need/provide challenge
-                return parsed_info
-            else:
-                logger.debug(f"Failed to parse INFO response. Response: {response[:100]}...")
-                return None
-        return None
-
-    def get_rules(self):
-        """Gets server rules/cvars (A2S_RULES). Returns dict of rules or None."""
-        if self.last_challenge is None:
-            # Try getting info first to potentially get a challenge number
-            logger.debug("No challenge key, attempting get_info first...")
-            self.get_info()
-            if self.last_challenge is None:
-                 # Still no challenge, GoldSrc servers might use 0xFFFFFFFF or no challenge
-                 # Let's try with a default challenge value often used for GoldSrc compatibility
-                 logger.debug("No challenge key found, using default challenge for rules query.")
-                 challenge_bytes = b'\xFF\xFF\xFF\xFF'
-                 # Alternatively: return None - safer if server strictly requires challenge
-                 # return None
-            else:
-                 challenge_bytes = self.last_challenge
-        else:
-            challenge_bytes = self.last_challenge
-
-        request = b'\xFF\xFF\xFF\xFFV' + challenge_bytes # A2S_RULES request: 0x56
-        response, _ = self._send_recv(request) # Ping isn't the primary goal here
-
-        if response and response[4:5] == b'E': # 0x45 A2S_RULES response header
-            return self._parse_rules(response)
-        elif response:
-            logger.debug(f"Received unexpected response type for RULES query: {response[4:5]}. Response: {response[:100]}...")
-            return None
-        else:
-            logger.debug("No response received for RULES query.")
-            return None
+                return None # Return None on unexpected errors
+        return None # Explicitly return None if all retries fail
 
     def _parse_info(self, response):
-        # (Parsing logic remains mostly the same as before)
+        # THIS PARSING LOGIC MUST CORRECTLY EXTRACT 'map' for the download to work
         try:
             if not response or response[:4] != b'\xFF\xFF\xFF\xFF':
                  logger.debug(f"Invalid response header: {response[:10]}")
                  return None
-            header_byte = response[4:5] # This is the response TYPE ('I', 'm', 'A', etc.)
-            offset = 5
+            response_type = response[4:5]
+            offset = 5 # Start reading after the 4 x 0xFF and the type byte
 
-            # Handle different response types if necessary
-            if header_byte == b'I': # Source Engine Info Reply
-                offset += 1 # Skip protocol version byte
-                # --- Source Specific Parsing ---
-                def read_string(data, start_offset):
-                    end = data.find(b'\x00', start_offset)
-                    if end == -1: raise ValueError("Malformed string field (Source)")
-                    return data[start_offset:end].decode('utf-8', errors='ignore'), end + 1
-
-                server_name, offset = read_string(response, offset)
-                map_name, offset = read_string(response, offset)
-                game_dir, offset = read_string(response, offset)
-                game_desc, offset = read_string(response, offset)
-
-                if offset + 9 > len(response): raise ValueError("Response too short for Source numeric fields")
-                # app_id = int.from_bytes(response[offset:offset+2], 'little'); offset += 2 # Skip AppID
-                offset += 2 # Skip AppID
-                player_count = response[offset]; offset += 1
-                max_players = response[offset]; offset += 1
-                bot_count = response[offset]; offset += 1
-                # Other fields skipped: server_type, environment, visibility, vac
-                offset += 4 # Skip server_type(c), environment(c), visibility(b), vac(b)
-
-                # Add more fields if needed (version string, EDF)
-
-                return {
-                    'name': server_name, 'map': map_name, 'game': game_dir, 'description': game_desc,
-                    'players': player_count, 'max_players': max_players, 'bots': bot_count,
-                    # Ping added later in get_info
-                }
-
-            elif header_byte == b'm': # GoldSrc Info Reply (Different format)
-                 # Address string first
-                addr_end = response.find(b'\x00', offset)
-                if addr_end == -1: raise ValueError("Malformed address string (GoldSrc)")
-                # server_addr_str = response[offset:addr_end].decode('utf-8', errors='ignore')
-                offset = addr_end + 1
-
-                def read_string_gs(data, start_offset):
-                    end = data.find(b'\x00', start_offset)
-                    if end == -1: raise ValueError("Malformed string field (GoldSrc)")
-                    return data[start_offset:end].decode('utf-8', errors='ignore'), end + 1
-
-                server_name, offset = read_string_gs(response, offset)
-                map_name, offset = read_string_gs(response, offset)
-                game_dir, offset = read_string_gs(response, offset)
-                game_desc, offset = read_string_gs(response, offset)
-
-                if offset + 3 > len(response): raise ValueError("Response too short for GoldSrc numeric fields")
-                player_count = response[offset]; offset += 1
-                max_players = response[offset]; offset += 1
-                # protocol_ver = response[offset]; offset += 1 # Skip protocol version
-                offset += 1
-
-                # Other fields skipped: server_type, environment, visibility, mod
-                # Note: Bot count isn't standard in this reply
-
-                return {
-                    'name': server_name, 'map': map_name, 'game': game_dir, 'description': game_desc,
-                    'players': player_count, 'max_players': max_players, 'bots': 0, # Assume 0 bots
-                    # Ping added later in get_info
-                }
-            elif header_byte == b'A': # Challenge response - not info
-                 logger.debug("Received challenge response instead of info.")
-                 return None # Or handle challenge saving here if needed elsewhere
-            else:
-                 logger.debug(f"Unsupported INFO response type: {header_byte}")
-                 return None
-
-        except (IndexError, ValueError) as e:
-             logger.warning(f"Parsing error ({type(e).__name__}) for INFO response: {e}. Response: {response[:100]}...")
-             return None
-        except Exception as e:
-             logger.error(f"Unexpected error parsing server info: {type(e).__name__} - {str(e)}", exc_info=False)
-             return None
-
-    def _parse_rules(self, response):
-        """Parses A2S_RULES response (0x45)."""
-        try:
-            if not response or len(response) < 7 or response[:5] != b'\xFF\xFF\xFF\xFFE':
-                logger.debug(f"Invalid RULES response header or length: {response[:10]}")
+            if response_type not in [b'I', b'm']:
+                logger.debug(f"Unsupported response type: {response_type}")
                 return None
 
-            rules_count = int.from_bytes(response[5:7], 'little')
-            offset = 7
-            rules = {}
+            def read_string(data, start_offset):
+                end = data.find(b'\x00', start_offset)
+                if end == -1:
+                    logger.warning(f"Could not find null terminator for string starting at offset {start_offset}")
+                    raise ValueError("Malformed string field") # Indicate parsing failure
+                return data[start_offset:end].decode('utf-8', errors='ignore'), end + 1
 
-            for _ in range(rules_count):
-                # Read rule name
-                name_end = response.find(b'\x00', offset)
-                if name_end == -1: raise ValueError("Malformed rule name string")
-                rule_name = response[offset:name_end].decode('utf-8', errors='ignore')
-                offset = name_end + 1
+            server_name, offset = read_string(response, offset)
+            map_name, offset = read_string(response, offset) # <-- We need this map_name
+            game_dir, offset = read_string(response, offset)
+            game_desc, offset = read_string(response, offset)
 
-                # Read rule value
-                value_end = response.find(b'\x00', offset)
-                if value_end == -1: raise ValueError(f"Malformed rule value string for rule '{rule_name}'")
-                rule_value = response[offset:value_end].decode('utf-8', errors='ignore')
-                offset = value_end + 1
+            if response_type == b'I':
+                if offset + 2 > len(response):
+                   logger.warning(f"Response too short for AppID (Type 'I') at offset {offset}")
+                   raise ValueError("Response truncated before player info")
+                offset += 2
 
-                rules[rule_name] = rule_value
+            player_count = max_players = bot_count = 0
 
-            logger.debug(f"Parsed {len(rules)} rules. Found sv_downloadurl: {'yes' if 'sv_downloadurl' in rules else 'no'}")
-            return rules
+            if offset < len(response): player_count = response[offset]; offset += 1
+            else: raise ValueError("Response truncated before player count")
+            if offset < len(response): max_players = response[offset]; offset += 1
+            else: raise ValueError("Response truncated before max players")
+            if offset < len(response): bot_count = response[offset]; offset += 1
 
-        except (IndexError, ValueError) as e:
-             logger.warning(f"Parsing error ({type(e).__name__}) for RULES response: {e}. Response: {response[:100]}...")
+            return {
+                'name': server_name, 'map': map_name, 'game': game_dir, 'description': game_desc,
+                'players': player_count, 'max_players': max_players, 'bots': bot_count,
+                'ping': self.last_ping
+            }
+        # Keep original except blocks
+        except IndexError:
+             logger.warning("Index error during parsing, response might be incomplete or malformed.")
+             return None
+        except ValueError as e: # Catch our specific parsing errors
+             logger.warning(f"Parsing value error: {e}")
              return None
         except Exception as e:
-             logger.error(f"Unexpected error parsing server rules: {type(e).__name__} - {str(e)}", exc_info=False)
+             logger.error(f"Unexpected error parsing server info: {type(e).__name__} - {str(e)}", exc_info=False) # Show traceback if debugging needed
              return None
 
     def close(self):
-        # (Same as before)
         if self.sock:
             try: self.sock.close()
             except Exception: pass
             self.sock = None
 
 # ==============================================================
-# CS16BandwidthTester Class (Major Updates)
+# CS16RealDownloader Class (Major Changes Here)
 # ==============================================================
-class CS16BandwidthTester:
-    def __init__(self, server_ip, server_port, num_connections, test_duration,
-                 download_delay, verbose, storage_dir, continuous_mode, no_server_monitor,
-                 fastdl_url, download_maps_only): # <-- Added arguments
+class CS16RealDownloader:
+    def __init__(self, server_ip, server_port, fastdl_url, num_connections, test_duration,
+                 storage_dir, continuous_mode, no_server_monitor, delete_after_download,
+                 verbose, file_list_path):
 
         self.server_ip = server_ip; self.server_port = server_port
         self.num_connections = num_connections; self.test_duration = test_duration
-        self.download_delay = max(0, download_delay); self.verbose = verbose
-        self.continuous_mode = continuous_mode; self.storage_dir = storage_dir
-        self.no_server_monitor = no_server_monitor
-        self.manual_fastdl_url = fastdl_url # <-- Store manually provided URL
-        self.download_maps_only = download_maps_only # <-- Option to restrict downloads
+        self.verbose = verbose; self.continuous_mode = continuous_mode
+        self.storage_dir = storage_dir; self.no_server_monitor = no_server_monitor
+        self.delete_after_download = delete_after_download
 
-        # --- Setup Storage and Logging ---
-        self.download_log_filepath = None # Will be set in start_test
+        # --- FastDL Setup ---
+        if not fastdl_url:
+            logger.error("FATAL: FastDL URL (--fastdl-url) is required for actual downloads.")
+            raise ValueError("FastDL URL is missing.")
+        # Ensure URL ends with a slash
+        self.fastdl_base_url = fastdl_url if fastdl_url.endswith('/') else fastdl_url + '/'
+        logger.info(f"Using FastDL base URL: {self.fastdl_base_url}")
+
+        # --- File List ---
+        self.files_to_try = []
+        self.current_map_file = None # Will be updated by server monitor
+        self._load_file_list(file_list_path)
+        # Add some common default files if the list is empty (optional)
+        if not self.files_to_try:
+             logger.warning("No file list provided or file list empty. Will rely solely on current map.")
+             # Example defaults:
+             # self.files_to_try.extend([
+             #     "sound/ambience/alien_cycletone.wav", "sprites/laserbeam.spr",
+             #     "models/player.mdl", "overviews/de_dust2.bmp"
+             # ])
+
         if not os.path.exists(self.storage_dir):
             try:
                 os.makedirs(self.storage_dir)
                 logger.info(f"Created storage directory: {self.storage_dir}")
             except OSError as e:
-                logger.error(f"Failed to create storage directory '{self.storage_dir}': {e}. Using current directory.")
-                self.storage_dir = "." # Fallback
+                logger.error(f"Failed to create storage directory '{self.storage_dir}': {e}")
+                self.storage_dir = "." # Fallback to current dir
 
-        # Configure the file handler for download logs
-        try:
-            self.download_log_filepath = os.path.join(self.storage_dir, DOWNLOAD_LOG_FILENAME)
-            file_handler = logging.FileHandler(self.download_log_filepath, mode='a') # Append mode
-            file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-            file_handler.setFormatter(file_formatter)
-            download_logger.addHandler(file_handler)
-            download_logger.info("--- Download Log Started ---")
-        except Exception as e:
-            logger.error(f"Failed to configure download log file handler: {e}")
-            download_logger.addHandler(logging.NullHandler()) # Prevent errors if logging fails
-
-
-        self.active = False; self.connections = []; self.threads = []
+        self.active = False; self.threads = []
         self.lock = threading.Lock()
         self._stop_event = threading.Event()
 
-        # Counters remain similar, but 'received' now tracks actual/simulated
-        self.bytes_sent = 0; self.bytes_received = 0
+        # --- Counters for REAL bandwidth ---
+        self.bytes_sent_http_requests = 0 # Minimal, just request headers
+        self.bytes_received_http = 0      # THIS IS THE REAL DOWNLOADED DATA
+        self.files_downloaded_count = 0
+        self.files_failed_count = 0
         self.start_time = 0; self.end_time = 0
-        self.initial_connection_failures = 0; self.runtime_connection_issues = 0
         self.active_workers_count = 0
-        self.http_download_attempts = 0 # New counter
-        self.http_download_successes = 0 # New counter
-        self.http_download_failures = 0 # New counter
-        self.simulated_downloads_run = 0 # New counter
 
-        # Server info tracking
         self.server_query = ServerQuery(server_ip, server_port) if not self.no_server_monitor else None
-        self.server_info = None # Holds result from get_info
-        self.server_rules = None # Holds result from get_rules
-        self.discovered_fastdl_url = None # URL found via rules query
-        self.active_fastdl_url = self.manual_fastdl_url # Prioritize manual URL
-        self.server_status = "MONITORING_DISABLED" if self.no_server_monitor else "UNKNOWN";
+        self.server_info = None; self.server_status = "MONITORING_DISABLED" if self.no_server_monitor else "UNKNOWN";
         self.server_last_seen = 0
-        self.server_info_thread = None; self.server_info_interval = 5 # Increase interval slightly
-        self.server_status_log = []
+        self.server_info_thread = None; self.server_info_interval = 5 # Query less often maybe
+        self.server_status_log = [] # Keep this for context
 
-        # Asset tracking (includes simulated and potentially real file names/URLs)
-        self.asset_downloads = {k: 0 for k in DOWNLOAD_SIZES}; self.asset_bandwidth = {k: 0 for k in DOWNLOAD_SIZES}
-        self.downloaded_files = []; self.last_downloaded_files = collections.deque(maxlen=LAST_FILES_DISPLAY_COUNT) # Now stores URLs or simulated names
-        self.bandwidth_log_points = []
+        # Use deque for recent files display
+        self.last_download_activity = collections.deque(maxlen=LAST_FILES_DISPLAY_COUNT)
+        self.bandwidth_log_points = [] # Track real download rate
 
         self.display_thread = None
+        self.session = requests.Session() # Use a session for potential connection reuse
 
-    # --- Counter Methods (Same as before) ---
+    def _load_file_list(self, file_path):
+        if file_path:
+            try:
+                with open(file_path, 'r') as f:
+                    for line in f:
+                        file = line.strip()
+                        # Basic validation: remove leading slashes, ignore empty
+                        if file and not file.startswith('#'): # Allow comments
+                            self.files_to_try.append(file.lstrip('/\\'))
+                logger.info(f"Loaded {len(self.files_to_try)} file paths from '{file_path}'")
+            except FileNotFoundError:
+                logger.error(f"File list not found: {file_path}")
+            except Exception as e:
+                logger.error(f"Error reading file list '{file_path}': {e}")
+        else:
+             logger.info("No file list path specified.")
+
+
     def _increment_counter(self, counter_name, value=1):
         with self.lock: setattr(self, counter_name, getattr(self, counter_name) + value)
     def _decrement_counter(self, counter_name, value=1): self._increment_counter(counter_name, -value)
 
-    def _create_connection(self, conn_id):
-        # Create UDP socket for potential simulation fallback or future UDP tasks
-        sock = None
+    def _get_file_to_download(self):
+        """Selects a file path to attempt downloading."""
+        with self.lock:
+            # Prioritize current map if available
+            if self.current_map_file and random.random() < 0.6: # 60% chance to try map
+                 # Check if it's already in the list to avoid duplicates if map name was also in file list
+                 if self.current_map_file not in self.files_to_try:
+                     return self.current_map_file
+
+            # Choose randomly from the provided list
+            if self.files_to_try:
+                 return random.choice(self.files_to_try)
+
+            # Fallback if list is empty and map isn't set yet
+            return None
+
+
+    def _perform_http_download(self, worker_id, file_rel_path):
+        """Attempts to download a single file via HTTP."""
+        if not file_rel_path or self._stop_event.is_set():
+            return False, 0
+
+        # Construct full URL (handle potential double slashes, etc.)
+        # file_rel_path should be like 'maps/de_dust2.bsp'
         try:
-            # Still create UDP socket for potential fallback/other queries
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.settimeout(2.0)
-        except Exception as e: logger.error(f"Conn {conn_id}: UDP Socket create error: {e}"); sock = None # Don't fail entirely if UDP fails
+             full_url = urljoin(self.fastdl_base_url, file_rel_path.replace('\\', '/'))
+        except Exception as e:
+             logger.error(f"Worker {worker_id}: Invalid URL construction for path '{file_rel_path}' with base '{self.fastdl_base_url}': {e}")
+             log_download_attempt(f"Base:{self.fastdl_base_url} Path:{file_rel_path}", "URL_ERROR", 0, str(e))
+             self._increment_counter("files_failed_count")
+             with self.lock: self.last_download_activity.append(f"{file_rel_path} - URL ERR")
+             return False, 0
 
-        # Return structure, socket might be None
-        return {
-            "id": conn_id,
-            "socket": sock, # UDP socket
-            "bytes_sent": 0, # Tracks UDP sends mostly
-            "bytes_received": 0, # Tracks ACTUAL HTTP downloads + simulated UDP downloads
-            "last_activity_time": 0,
-            "requests_sent": 0, # UDP requests
-            "http_attempts": 0,
-            "http_successes": 0,
-            "sim_attempts": 0, # Simulation attempts
-            "status": "running"
-        }
 
-    def _log_download_event(self, worker_id, url, status, bytes_dl=0, error_msg="", local_path=None):
-        """Logs download details to the dedicated file and potentially console."""
-        message = f"Worker {worker_id:<3} | URL: {url} | Status: {status:<8}"
-        if bytes_dl > 0:
-             message += f" | Bytes: {bytes_dl:<10}"
-        if local_path:
-             message += f" | Path: {local_path}"
-        if error_msg:
-             message += f" | Error: {error_msg}"
+        # Construct local path
+        # Ensure the path is relative and safe
+        if file_rel_path.startswith('/') or '..' in file_rel_path:
+             logger.warning(f"Worker {worker_id}: Skipped potentially unsafe file path '{file_rel_path}'")
+             log_download_attempt(full_url, "PATH_SKIP", 0, "Unsafe path")
+             self._increment_counter("files_failed_count") # Count as failure
+             with self.lock: self.last_download_activity.append(f"{file_rel_path} - PATH SKIP")
+             return False, 0
 
-        download_logger.info(message)
-        if status == "SUCCESS":
-             logger.debug(f"Worker {worker_id}: Download SUCCESS: {url} ({bytes_dl} bytes)")
-        elif status != "DELETED": # Don't spam console with delete messages
-             logger.warning(f"Worker {worker_id}: Download {status}: {url} - {error_msg}")
+        local_filepath = os.path.join(self.storage_dir, file_rel_path)
+        local_dir = os.path.dirname(local_filepath)
 
-        # Also add URL to the deque for UI display (maybe only on success?)
-        if status == "SUCCESS":
-             with self.lock:
-                 self.last_downloaded_files.append(f"{url} ({bytes_dl/1024:.1f}KB)")
+        if self.verbose: logger.debug(f"Worker {worker_id}: Attempting DL: {full_url} -> {local_filepath}")
 
-    def _perform_http_download(self, conn_info, url, target_filename):
-        """Attempts to download a file via HTTP, verifies, and deletes it."""
-        conn_id = conn_info['id']
-        local_filepath = os.path.join(self.storage_dir, f"worker_{conn_id}_{target_filename}") # Unique temp file per worker
-        downloaded_bytes = 0
-        conn_info["http_attempts"] += 1
-        self._increment_counter("http_download_attempts")
-
-        session = requests.Session() # Use session for potential keep-alive
+        bytes_downloaded = 0
+        success = False
+        status_code = -1
+        error_msg = ""
 
         try:
-            conn_info["status"] = "http_downloading"
-            conn_info["last_activity_time"] = time.time()
-            # Add User-Agent? Some servers might block default requests agent
-            headers = {'User-Agent': 'CSBandwidthTester/1.0'}
-            with session.get(url, stream=True, timeout=HTTP_TIMEOUT, headers=headers) as response:
+            # Create necessary local directories
+            os.makedirs(local_dir, exist_ok=True)
+
+            # Perform the download using the session
+            with self.session.get(full_url, stream=True, timeout=REQUEST_TIMEOUT) as response:
+                status_code = response.status_code
                 response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
 
                 with open(local_filepath, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
+                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                         if self._stop_event.is_set():
-                            raise InterruptedError("Stop event triggered during download")
+                             error_msg = "Download interrupted by stop signal."
+                             log_download_attempt(full_url, "INTERRUPTED", bytes_downloaded, error_msg)
+                             raise StopIteration("Download stopped") # Custom exception or break
+
                         if chunk: # filter out keep-alive new chunks
                             f.write(chunk)
                             chunk_len = len(chunk)
-                            downloaded_bytes += chunk_len
-                            # --- Update REAL bandwidth counters ---
-                            self._increment_counter("bytes_received", chunk_len)
-                            conn_info["bytes_received"] += chunk_len
-                            conn_info["last_activity_time"] = time.time()
-                            # Optional: small sleep to throttle?
-                            # time.sleep(0.001)
+                            bytes_downloaded += chunk_len
+                            # Update global counter under lock for accuracy
+                            self._increment_counter("bytes_received_http", chunk_len)
+                            # We don't track HTTP request bytes sent accurately, it's minor
+                            # self._increment_counter("bytes_sent_http_requests", ...)
 
-            # --- Verification ---
-            conn_info["status"] = "http_verifying"
-            if not os.path.exists(local_filepath):
-                raise FileNotFoundError("Downloaded file not found after download completed.")
-
-            # Optional: Check size if header was present
-            content_length = response.headers.get('content-length')
-            if content_length and int(content_length) != downloaded_bytes:
-                 logger.warning(f"Worker {conn_id}: Size mismatch for {url}. Expected {content_length}, got {downloaded_bytes}. Keeping file.")
-                 # Don't delete if size mismatch for inspection? Or delete anyway? Let's delete.
-                 raise ValueError(f"Size mismatch: Expected {content_length}, Got {downloaded_bytes}")
-
-            # --- Success ---
-            conn_info["http_successes"] += 1
-            self._increment_counter("http_download_successes")
-            self._log_download_event(conn_id, url, "SUCCESS", downloaded_bytes, local_path=local_filepath)
-            return True # Indicates success
+                # If loop completes without error
+                success = True
+                log_download_attempt(full_url, f"OK ({status_code})", bytes_downloaded)
+                if self.verbose: logger.debug(f"Worker {worker_id}: Success DL: {file_rel_path} ({bytes_downloaded} bytes)")
 
         except requests.exceptions.Timeout:
-             self._increment_counter("http_download_failures")
-             self._increment_counter("runtime_connection_issues")
-             self._log_download_event(conn_id, url, "TIMEOUT", downloaded_bytes, "Request timed out")
-             conn_info["status"] = "timeout"
-             return False
-        except requests.exceptions.ConnectionError as e:
-             self._increment_counter("http_download_failures")
-             self._increment_counter("runtime_connection_issues")
-             self._log_download_event(conn_id, url, "CONN_ERR", downloaded_bytes, str(e))
-             conn_info["status"] = "error"
-             return False
+            error_msg = f"Timeout after {REQUEST_TIMEOUT}s"
+            logger.warning(f"Worker {worker_id}: Timeout downloading {full_url}")
+            log_download_attempt(full_url, "TIMEOUT", bytes_downloaded, error_msg)
         except requests.exceptions.HTTPError as e:
-             self._increment_counter("http_download_failures")
-             # Don't count HTTP errors (like 404) as generic runtime issues unless desired
-             self._log_download_event(conn_id, url, f"HTTP_{e.response.status_code}", downloaded_bytes, str(e))
-             conn_info["status"] = "http_error"
-             return False
-        except InterruptedError:
-            logger.info(f"Worker {conn_id}: Download interrupted: {url}")
-            self._log_download_event(conn_id, url, "INTERRUPT", downloaded_bytes, "Test stopped")
-            conn_info["status"] = "stopped"
-            # Don't increment failure counters on graceful stop
-            return False
+             error_msg = f"HTTP Error {e.response.status_code}"
+             # Log 404s less loudly maybe
+             log_level = logging.WARNING if e.response.status_code == 404 else logging.ERROR
+             logger.log(log_level, f"Worker {worker_id}: {error_msg} for {full_url}")
+             log_download_attempt(full_url, f"HTTP_ERR_{status_code}", bytes_downloaded, str(e.response.reason))
+        except requests.exceptions.RequestException as e:
+             error_msg = f"Connection Error: {type(e).__name__}"
+             logger.error(f"Worker {worker_id}: Failed request for {full_url}: {e}")
+             log_download_attempt(full_url, "CONN_ERROR", bytes_downloaded, str(e))
+        except (OSError, IOError) as e:
+             error_msg = f"File System Error: {e}"
+             logger.error(f"Worker {worker_id}: Error writing file {local_filepath}: {e}")
+             log_download_attempt(full_url, "FS_ERROR", bytes_downloaded, str(e))
+        except StopIteration: # Handle our custom stop signal
+             pass # Already logged
         except Exception as e:
-             self._increment_counter("http_download_failures")
-             self._increment_counter("runtime_connection_issues")
-             logger.error(f"Worker {conn_id}: Unhandled HTTP download error for {url}: {type(e).__name__} - {str(e)}", exc_info=self.verbose)
-             self._log_download_event(conn_id, url, "FAILED", downloaded_bytes, f"{type(e).__name__}: {str(e)}")
-             conn_info["status"] = "error"
-             return False
-        finally:
-            # --- Cleanup ---
-            if os.path.exists(local_filepath):
-                try:
-                    os.remove(local_filepath)
-                    # Only log deletion if download wasn't interrupted/failed badly before logging success
-                    if conn_info.get("status") not in ["error", "timeout", "stopped", "http_error", "conn_err"]:
-                         self._log_download_event(conn_id, url, "DELETED", local_path=local_filepath)
-                except OSError as e:
-                    logger.error(f"Worker {conn_id}: Failed to delete temp file {local_filepath}: {e}")
-            conn_info["status"] = "idle" # Reset status after attempt
+             error_msg = f"Unexpected Error: {type(e).__name__}"
+             logger.error(f"Worker {worker_id}: Unexpected error downloading {full_url}: {e}", exc_info=self.verbose)
+             log_download_attempt(full_url, "UNEXPECTED_ERR", bytes_downloaded, str(e))
 
-    def _simulate_asset_download(self, conn_info):
-        # (Simulation logic remains largely the same, but now logs differently and increments different counter)
-        if not self.active or self._stop_event.is_set() or not conn_info or not conn_info.get("socket"):
-            if conn_info: conn_info["status"] = "stopped" if self._stop_event.is_set() else "error"
-            return False
+        # Update counters and activity log
+        with self.lock:
+            if success:
+                self.files_downloaded_count += 1
+                self.last_download_activity.append(f"{file_rel_path} ({bytes_downloaded/1024:.1f}K) OK")
+                # --- Optional: Delete after download ---
+                if self.delete_after_download:
+                    try:
+                        os.remove(local_filepath)
+                        if self.verbose: logger.debug(f"Worker {worker_id}: Deleted {local_filepath}")
+                        self.last_download_activity.append(f"{file_rel_path} - DELETED")
+                    except OSError as e:
+                        logger.warning(f"Worker {worker_id}: Failed to delete {local_filepath}: {e}")
+                        self.last_download_activity.append(f"{file_rel_path} - DEL FAILED")
 
-        sock = conn_info["socket"]; conn_id = conn_info["id"]
-        conn_info["status"] = "udp_simulating"; conn_info["sim_attempts"] += 1
-        self._increment_counter("simulated_downloads_run") # Track that simulation ran
-        conn_info["last_activity_time"] = time.time()
+            else:
+                self.files_failed_count += 1
+                status_tag = f"ERR {status_code}" if status_code > 0 else "FAILED"
+                self.last_download_activity.append(f"{file_rel_path} - {status_tag}")
+                 # Attempt to clean up partially downloaded file on failure
+                if os.path.exists(local_filepath) and bytes_downloaded > 0:
+                    try: os.remove(local_filepath); logger.debug(f"Cleaned up partial file: {local_filepath}")
+                    except OSError: logger.warning(f"Could not remove partial file: {local_filepath}")
 
-        try:
-            # Choose random asset type and size for simulation
-            asset_type = random.choice(list(DOWNLOAD_SIZES.keys())); asset_size = DOWNLOAD_SIZES[asset_type]
-            asset_id = random.randint(1000, 9999); base_request = random.choice(CS_FILE_REQUESTS)
-            # Use a generic request, the filename part doesn't really matter for simulation
-            custom_request = base_request # Example: b"\xff\xff\xff\xffping\x00"
 
-            # Send a small UDP packet
-            sent_bytes = sock.sendto(custom_request, (self.server_ip, self.server_port))
-            conn_info["bytes_sent"] += sent_bytes # Track UDP bytes sent
-            self._increment_counter("bytes_sent", sent_bytes)
-            conn_info["requests_sent"] += 1
+        return success, bytes_downloaded
 
-            # --- SIMULATION Part ---
-            # No actual recv() loop for bulk data here
-            simulated_received_total = asset_size # Assume full download for simulation
-            if simulated_received_total > 0:
-                 # Increment counters based on simulated size
-                 conn_info["bytes_received"] += simulated_received_total
-                 self._increment_counter("bytes_received", simulated_received_total)
 
-                 # Store simulated metadata (less useful now, but keep for consistency?)
-                 sim_filename = f"sim_{asset_type}_{asset_id}.dat"
-                 # self._store_asset_metadata(asset_type, asset_id, simulated_received_total)
-                 with self.lock:
-                     # Add simulated file to UI deque
-                     self.last_downloaded_files.append(f"{sim_filename} ({simulated_received_total/1024:.1f}KB) [SIM]")
-                     # Update simulation-specific counters if needed
-                     self.asset_downloads[asset_type] += 1
-                     self.asset_bandwidth[asset_type] += simulated_received_total
-
-                 # Apply simulated delay if configured
-                 if self.download_delay > 0:
-                     # Simple delay based on total size
-                      time.sleep(max(0.001, self.download_delay * (asset_size / (1024*1024)) )) # Delay proportional to simulated MB
-
-            conn_info["last_activity_time"] = time.time()
-            conn_info["status"] = "idle"
-            return True # Simulation considered "successful" if it ran
-
-        except socket.timeout:
-            if self.verbose: logger.debug(f"Conn {conn_id}: Timeout sending UDP request for simulation.")
-            self._increment_counter("runtime_connection_issues"); conn_info["status"] = "timeout"; return False
-        except OSError as e:
-             logger.error(f"Conn {conn_id} OS Error (UDP Simulation): {e}. Closing UDP socket.")
-             try: sock.close()
-             except Exception: pass
-             conn_info["socket"] = None; conn_info["status"] = "error"; self._increment_counter("runtime_connection_issues"); return False
-        except Exception as e:
-            logger.error(f"Conn {conn_id} unexpected error during UDP simulation setup: {type(e).__name__} - {str(e)}")
-            conn_info["status"] = "error"; self._increment_counter("runtime_connection_issues"); return False
-
-    def _connection_worker(self, conn_info):
-        # (Worker logic now decides between HTTP download and Simulation)
-        conn_id = conn_info['id']
-        if self.verbose: logger.debug(f"Worker {conn_id}: Started")
+    def _connection_worker(self, worker_id):
+        """Worker thread that repeatedly tries to download files."""
+        if self.verbose: logger.debug(f"Worker {worker_id}: Started")
         self._increment_counter("active_workers_count")
-        conn_info["status"] = "idle"
-
         try:
             while self.active and not self._stop_event.is_set():
-                conn_info["status"] = "deciding"
-                # --- Decision Logic ---
-                fastdl_url_to_use = None
-                map_name_to_use = None
-                can_attempt_http = False
+                file_to_try = self._get_file_to_download()
 
-                with self.lock: # Access shared server info safely
-                    fastdl_url_to_use = self.active_fastdl_url # Gets manual or discovered
-                    current_map = self.server_info.get('map') if self.server_info else None
-                    if fastdl_url_to_use and current_map:
-                         map_name_to_use = current_map.replace('\\','/').split('/')[-1] # Basic sanitation
-                         if map_name_to_use: # Ensure map name is valid
-                             can_attempt_http = True
+                if not file_to_try:
+                    # No files available (list empty and map unknown?)
+                    logger.debug(f"Worker {worker_id}: No file available to download, sleeping.")
+                    time.sleep(2.0) # Wait longer if there's nothing to do
+                    continue
 
-                # --- Perform Action ---
-                success = False
-                if can_attempt_http:
-                    # Construct target URL (assuming /maps/ structure)
-                    # Ensure base URL has trailing slash for urljoin
-                    base = fastdl_url_to_use if fastdl_url_to_use.endswith('/') else fastdl_url_to_use + '/'
-                    map_filename = f"{map_name_to_use}.bsp"
-                    relative_path = f"maps/{map_filename}" # Common structure
-                    full_url = urljoin(base, relative_path)
+                # Perform the actual download attempt
+                success, bytes_dl = self._perform_http_download(worker_id, file_to_try)
 
-                    if self.verbose: logger.debug(f"Worker {conn_id}: Attempting HTTP download: {full_url}")
-                    success = self._perform_http_download(conn_info, full_url, map_filename)
-                    if not success:
-                        # Optional: Fallback to simulation if HTTP fails? Or just wait?
-                        # logger.warning(f"Worker {conn_id}: HTTP download failed, simulating instead.")
-                        # success = self._simulate_asset_download(conn_info)
-                        pass # Just let it loop and try again later
-
-                else:
-                    # Fallback to simulation if no FastDL URL or map known
-                    if self.verbose: logger.debug(f"Worker {conn_id}: No FastDL URL/Map available, running simulation.")
-                    if conn_info.get("socket"): # Check if UDP socket exists for simulation
-                         success = self._simulate_asset_download(conn_info)
-                    else:
-                         # No UDP socket, maybe try to recreate or just log error?
-                         logger.warning(f"Worker {conn_id}: Cannot simulate, UDP socket is unavailable.")
-                         conn_info["status"] = "error"
-                         self._increment_counter("runtime_connection_issues")
-                         time.sleep(5) # Wait longer if in error state
-
-                # --- Wait before next iteration ---
-                # Add delay even after failures to prevent spamming
-                worker_delay = random.uniform(0.5, 2.0) # Slightly longer base delay?
-                conn_info["status"] = "idle"
+                # Wait before next attempt
+                # Make delay shorter if download failed (e.g. 404), maybe longer if succeeded
+                delay_base = 0.1 if success else 0.5
+                worker_delay = random.uniform(delay_base, delay_base + 0.2)
                 time.sleep(worker_delay)
 
         except Exception as e:
-            logger.error(f"Worker {conn_id}: Unhandled loop error: {type(e).__name__} - {str(e)}", exc_info=self.verbose)
-            conn_info["status"] = "error"; self._increment_counter("runtime_connection_issues")
+            logger.error(f"Worker {worker_id}: Unhandled loop error: {type(e).__name__} - {str(e)}", exc_info=self.verbose)
+            # Consider incrementing a dedicated worker error counter
         finally:
             self._decrement_counter("active_workers_count")
-            conn_info["status"] = "stopped"
-            # Close UDP socket if it exists
-            sock = conn_info.get("socket")
-            if sock:
-                try: sock.close()
-                except Exception: pass
-            if self.verbose: logger.debug(f"Worker {conn_id}: Finished. Sent (UDP): {conn_info['bytes_sent']/1024:.1f}KB, Recv (HTTP+Sim): {conn_info['bytes_received']/1024:.1f}KB")
+            if self.verbose: logger.debug(f"Worker {worker_id}: Finished.")
+
 
     def _update_server_info(self):
-        # (Updated to also query rules and manage FastDL URL)
-        if not self.server_query:
-            logger.info("Server monitoring disabled.")
-            return
-
+        """Updates server info (esp. map name) periodically."""
+        if not self.server_query: return # Skip if monitoring disabled
         if self.verbose: logger.debug("Server monitor thread started.")
-        last_rules_query_time = 0
-        rules_query_interval = 30 # Query rules less frequently than basic info
 
         while self.active and not self._stop_event.is_set():
             current_status = "UNKNOWN"; ping = -1; info_for_log = {}
-            timestamp = time.time()
-            rules_updated = False
-
+            map_name = None
             try:
-                # --- Get Basic Info ---
-                server_info = self.server_query.get_info() # Tries to get info and challenge
+                server_info = self.server_query.get_info()
+                timestamp = time.time()
                 if server_info:
                     with self.lock:
-                        self.server_info = server_info # Update main info
-                        self.server_last_seen = timestamp
+                        self.server_info = server_info; self.server_last_seen = timestamp
                         ping = server_info.get('ping', -1)
                         current_status = "ISSUES" if ping > HIGH_PING_THRESHOLD else "ONLINE"
                         self.server_status = current_status
-                    info_for_log = {'timestamp': timestamp, 'status': current_status, 'ping': ping,
-                                    'players': server_info.get('players', 0), 'max_players': server_info.get('max_players', 0),
-                                    'name': server_info.get('name','N/A'), 'map': server_info.get('map', 'N/A')}
-
-                    # --- Get Rules (Less Frequently) ---
-                    if (timestamp - last_rules_query_time > rules_query_interval):
-                        logger.debug("Querying server rules...")
-                        server_rules = self.server_query.get_rules()
-                        last_rules_query_time = timestamp
-                        if server_rules is not None: # Store even if empty dict
-                             rules_updated = True
-                             with self.lock:
-                                 self.server_rules = server_rules
-                                 self.discovered_fastdl_url = server_rules.get('sv_downloadurl')
-                                 # Update active URL (prioritize manual)
-                                 self.active_fastdl_url = self.manual_fastdl_url if self.manual_fastdl_url else self.discovered_fastdl_url
-                                 if self.active_fastdl_url:
-                                     logger.info(f"Using FastDL URL: {self.active_fastdl_url}")
-                                 elif self.manual_fastdl_url is None:
-                                     logger.info("No FastDL URL provided or discovered.")
-
+                        # --- Get the map name ---
+                        map_name = server_info.get('map')
+                        if map_name:
+                            # Construct the relative path for download
+                            self.current_map_file = f"maps/{map_name}.bsp"
+                            if self.verbose: logger.debug(f"Server Map Updated: {self.current_map_file}")
                         else:
-                             logger.warning("Failed to get/parse server rules.")
-                             with self.lock: # Clear stale rules/url if query fails
-                                self.server_rules = None
-                                self.discovered_fastdl_url = None
-                                self.active_fastdl_url = self.manual_fastdl_url # Revert to manual if discovery fails
-
-
-                else: # Info query failed
+                            # Map name not found in query? Clear it.
+                            self.current_map_file = None
+                    info_for_log = {'timestamp': timestamp, 'status': current_status, 'ping': ping, 'map': map_name} # Add map to log
+                else:
                     with self.lock:
-                        # Update status based on timeout
                         if self.server_last_seen > 0 and (timestamp - self.server_last_seen > SERVER_OFFLINE_TIMEOUT):
                             current_status = "OFFLINE"
-                        else:
-                            current_status = "ISSUES" if self.server_status != "OFFLINE" else "OFFLINE"
-                        self.server_info = None # Clear stale info
-                        self.server_rules = None # Clear rules if info fails
-                        self.discovered_fastdl_url = None
-                        self.active_fastdl_url = self.manual_fastdl_url # Revert to manual
-                        self.server_status = current_status
-                    info_for_log = {'timestamp': timestamp, 'status': current_status, 'ping': -1,
-                                    'players': -1, 'max_players': -1}
+                        else: current_status = "ISSUES" if self.server_status != "OFFLINE" else "OFFLINE"
+                        self.server_info = None; self.server_status = current_status
+                        self.current_map_file = None # Clear map if server offline/issues
+                    info_for_log = {'timestamp': timestamp, 'status': current_status, 'ping': -1}
 
-            except Exception as e: # Catch unexpected errors in this thread
-                logger.error(f"Unexpected server info/rules error: {type(e).__name__} - {str(e)}", exc_info=self.verbose)
+            except Exception as e:
+                logger.error(f"Unexpected server info error: {type(e).__name__} - {str(e)}")
                 with self.lock:
-                    current_status = "ERROR"; self.server_info = None; self.server_rules = None; self.server_status = current_status
-                    self.discovered_fastdl_url = None; self.active_fastdl_url = self.manual_fastdl_url
+                    current_status = "ERROR"; self.server_info = None; self.server_status = current_status
+                    self.current_map_file = None # Clear map on error
                 info_for_log = {'timestamp': time.time(), 'status': current_status, 'ping': -1}
 
-            # Log status point
             if info_for_log:
-                with self.lock:
-                    if rules_updated: # Add rules info if updated this cycle
-                         info_for_log['rules_count'] = len(self.server_rules) if self.server_rules else 0
-                         info_for_log['fastdl_discovered'] = bool(self.discovered_fastdl_url)
-                         info_for_log['fastdl_active'] = bool(self.active_fastdl_url)
-                    self.server_status_log.append(info_for_log)
+                with self.lock: self.server_status_log.append(info_for_log)
 
-            # Wait before next query, check stop event frequently
+            # Wait before next query
             sleep_interval = 0.1
             sleep_end = time.time() + self.server_info_interval
             while time.time() < sleep_end:
@@ -726,115 +488,101 @@ class CS16BandwidthTester:
         if self.verbose: logger.debug("Server monitor thread finished.")
 
     def _display_realtime_stats(self):
-        # (Updated to show HTTP stats and FastDL status)
+        """Displays real-time stats, focusing on actual downloads."""
         if self.verbose: logger.debug("Realtime display thread started.")
         last_bw_log_time = self.start_time
 
-        CURSOR_TO_HOME = "\033[H"
-        CLEAR_LINE = "\033[K"
-        CLEAR_SCREEN_FROM_CURSOR = "\033[J"
-
+        CURSOR_TO_HOME = "\033[H"; CLEAR_LINE = "\033[K"; CLEAR_SCREEN_FROM_CURSOR = "\033[J"
         term_width = 80
         try: term_width = os.get_terminal_size().columns
-        except OSError: pass
+        except OSError: logger.warning("Could not detect terminal width, using default 80."); term_width = 80
 
         while self.active and not self._stop_event.is_set():
             lines_to_print = []
             try:
                 with self.lock:
-                    # Gather stats
                     elapsed = time.time() - self.start_time if self.start_time > 0 else 0
-                    bytes_sent = self.bytes_sent; bytes_received = self.bytes_received
-                    active_workers = self.active_workers_count; runtime_issues = self.runtime_connection_issues
-                    initial_fails = self.initial_connection_failures
-                    last_files = list(self.last_downloaded_files) # Now contains URLs or sim names
+                    # --- Get REAL download stats ---
+                    bytes_received = self.bytes_received_http
+                    files_ok = self.files_downloaded_count
+                    files_err = self.files_failed_count
+                    active_workers = self.active_workers_count
+                    last_activity = list(self.last_download_activity) # Copy activity list
                     current_server_status = self.server_status
-                    current_server_info = self.server_info.copy() if self.server_info else None
-                    last_seen_time = self.server_last_seen
-                    current_fastdl_url = self.active_fastdl_url # Get the active URL
-                    http_attempts = self.http_download_attempts
-                    http_success = self.http_download_successes
-                    http_fails = self.http_download_failures
-                    sim_runs = self.simulated_downloads_run
+                    current_map = self.current_map_file # Get current map
 
                 # Calculate derived stats
-                sent_mb = bytes_sent / (1024*1024); recv_mb = bytes_received / (1024*1024) # Now potentially real MB
-                total_mb = sent_mb + recv_mb
-                avg_rate_mbs = total_mb / elapsed if elapsed > 0 else 0
-                avg_send_mbs = sent_mb / elapsed if elapsed > 0 else 0
-                avg_recv_mbs = recv_mb / elapsed if elapsed > 0 else 0 # Potentially real rate
+                recv_mb = bytes_received / (1024*1024)
+                avg_recv_mbs = recv_mb / elapsed if elapsed > 0 else 0
 
                 # Log bandwidth point
                 current_time = time.time()
                 if elapsed > 0 and (current_time - last_bw_log_time >= 1.0):
-                     with self.lock: self.bandwidth_log_points.append((elapsed, total_mb))
+                     with self.lock: self.bandwidth_log_points.append((elapsed, recv_mb))
                      last_bw_log_time = current_time
 
                 # --- Format Output Lines ---
                 status = "Running" if self.active else "Stopped"
                 mode = "Continuous" if self.continuous_mode else f"Timed ({self.test_duration}s)"
-                header = f"--- CS Bandwidth Test (HTTP/UDP): {self.server_ip}:{self.server_port} ---".center(term_width)
+                header = f"--- CS 1.6 REAL Bandwidth Test ({self.server_ip}:{self.server_port}) ---".center(term_width)
                 lines_to_print.append(header)
-                lines_to_print.append(f" Status: {status} | Mode: {mode}".ljust(term_width))
-                lines_to_print.append(f" Time: {elapsed:.1f}s".ljust(term_width))
-                lines_to_print.append(f" Workers: {active_workers}/{self.num_connections} | Issues: Init={initial_fails} Run={runtime_issues}".ljust(term_width))
+                lines_to_print.append(f" Target FastDL: {self.fastdl_base_url}".ljust(term_width))
+
+                line_status = f" Status: {status} | Mode: {mode}"
+                line_time = f"Time: {elapsed:.1f}s"
+                lines_to_print.append(f"{line_status:<{max(0, term_width - len(line_time))}}{line_time}")
+
+                line_workers = f" Workers: {active_workers}/{self.num_connections}"
+                line_files = f"Files OK: {files_ok} Failed: {files_err}"
+                lines_to_print.append(f"{line_workers:<{max(0, term_width - len(line_files))}}{line_files}")
 
                 lines_to_print.append("-" * term_width)
-                lines_to_print.append("[Server & FastDL Status]".center(term_width))
+                lines_to_print.append("[Server Status (UDP Query)]".center(term_width)) # Clarify source
 
-                # Server Status (similar to before)
-                if self.no_server_monitor: lines_to_print.append(" Server Monitoring Disabled".ljust(term_width))
+                if self.no_server_monitor:
+                     lines_to_print.append(" UDP Monitoring Disabled".ljust(term_width))
+                     lines_to_print.append(f" Current Map: UNKNOWN".ljust(term_width))
                 else:
-                    s_status_str = f" Server Status: {current_server_status}"
-                    s_ping_str = "Ping: N/A"; s_players_str = "Players: N/A"
-                    if current_server_info:
-                        ping_val = current_server_info.get('ping', -1)
-                        s_ping_str = f"Ping: {ping_val:>3}ms" if ping_val >= 0 else "Ping: N/A"
-                        s_players_str = f"Players: {current_server_info.get('players','?')}/{current_server_info.get('max_players','?')}"
-                        if current_server_info.get('bots',0) > 0: s_players_str += f" (B:{current_server_info['bots']})"
-                    # Add status details if needed
-                    lines_to_print.append(f"{s_status_str} | {s_ping_str} | {s_players_str}".ljust(term_width))
+                     # (Keep the server status display logic mostly the same as before)
+                     # ... but maybe add the current map derived from it ...
+                    s_status_str = f" Status: {current_server_status}"
+                    s_ping_str = "Ping: N/A"
+                    s_map_str = "Map: UNKNOWN"
+                    if self.server_info: # Use locked info if available
+                       ping_val = self.server_info.get('ping', -1)
+                       s_ping_str = f"Ping: {ping_val:>3}ms" if ping_val >= 0 else "Ping: N/A"
+                       map_val = self.server_info.get('map', 'UNKNOWN')
+                       s_map_str = f"Map: {map_val[:term_width-5]}" # Truncate map name
 
-                    s_name_str = " Name: N/A"; s_map_str = " Map: N/A"
-                    if current_server_info:
-                         max_len = term_width - len(" Name: ") - 1
-                         s_name_str = f" Name: {current_server_info.get('name', 'N/A')[:max_len]}"
-                         max_len = term_width - len(" Map: ") - 1
-                         s_map_str = f" Map: {current_server_info.get('map', 'N/A')[:max_len]}"
-                    lines_to_print.append(s_name_str.ljust(term_width))
+                    width_status = len(s_status_str)
+                    width_ping = len(s_ping_str)
+                    spaces1 = max(1, (term_width - width_status - width_ping) // 2)
+                    lines_to_print.append(f"{s_status_str}{' '*spaces1}{s_ping_str}".ljust(term_width))
                     lines_to_print.append(s_map_str.ljust(term_width))
-                    last_seen_str = f" Last Seen: {datetime.fromtimestamp(last_seen_time).strftime('%H:%M:%S')}" if last_seen_time > 0 else " Last Seen: Never"
-                    lines_to_print.append(last_seen_str.ljust(term_width))
-
-                # FastDL Status
-                if current_fastdl_url:
-                    url_display = current_fastdl_url[:term_width-15] + ('...' if len(current_fastdl_url) > term_width-15 else '')
-                    lines_to_print.append(f" FastDL Active: {url_display}".ljust(term_width))
-                elif self.manual_fastdl_url:
-                    lines_to_print.append(f" FastDL Manual: {self.manual_fastdl_url} (Not currently used/valid?)".ljust(term_width))
-                else:
-                    lines_to_print.append(" FastDL Status: Not Provided / Not Discovered".ljust(term_width))
 
 
                 lines_to_print.append("-" * term_width)
-                lines_to_print.append("[Bandwidth Usage (Actual/Sim)]".center(term_width))
-                lines_to_print.append(f" Total Sent (UDP): {sent_mb:>7.2f} MB   |   Recv (HTTP+Sim): {recv_mb:>7.2f} MB".ljust(term_width))
-                lines_to_print.append(f" Total Data:       {total_mb:>7.2f} MB   |   Avg Total Rate:  {avg_rate_mbs:>7.2f} MB/s".ljust(term_width))
-                # lines_to_print.append(f" Avg Rates: Send:{avg_send_mbs:>6.2f} MB/s Recv:{avg_recv_mbs:>6.2f} MB/s".ljust(term_width))
+                lines_to_print.append("[Real Bandwidth Usage (HTTP)]".center(term_width)) # Clarify source
+                bw_line1 = f" Total Received: {recv_mb:>8.2f} MB"
+                bw_line2 = f" Avg Recv Rate:  {avg_recv_mbs:>8.2f} MB/s"
+                lines_to_print.append(bw_line1.ljust(term_width))
+                lines_to_print.append(bw_line2.ljust(term_width))
+
 
                 lines_to_print.append("-" * term_width)
-                lines_to_print.append("[Download Activity]".center(term_width))
-                lines_to_print.append(f" HTTP Attempts: {http_attempts} | Success: {http_success} | Fail: {http_fails}".ljust(term_width))
-                lines_to_print.append(f" Simulations Run: {sim_runs}".ljust(term_width))
-                lines_to_print.append(f" Last {LAST_FILES_DISPLAY_COUNT} Events:".ljust(term_width))
-                if last_files:
-                    for i, fname_or_url in enumerate(reversed(last_files)): # Show most recent first
-                        max_len = term_width - 4 # Room for " - "
-                        lines_to_print.append(f" - {fname_or_url[:max_len]}".ljust(term_width))
-                    for _ in range(max(0, LAST_FILES_DISPLAY_COUNT - len(last_files))): lines_to_print.append(" ".ljust(term_width))
+                lines_to_print.append(f"[Last {LAST_FILES_DISPLAY_COUNT} Download Activities]".center(term_width))
+                if last_activity:
+                    for i, activity in enumerate(reversed(last_activity)): # Show newest first
+                        max_len = term_width - 2 # Room for padding
+                        lines_to_print.append(f" {activity[:max_len]}".ljust(term_width))
+                    # Pad if needed
+                    for _ in range(max(0, LAST_FILES_DISPLAY_COUNT - len(last_activity))):
+                        lines_to_print.append(" ".ljust(term_width))
                 else:
-                    lines_to_print.append("  (No download events yet)".ljust(term_width))
-                    for _ in range(max(0, LAST_FILES_DISPLAY_COUNT -1)): lines_to_print.append(" ".ljust(term_width))
+                    lines_to_print.append("  (No download attempts yet)".ljust(term_width))
+                    for _ in range(max(0, LAST_FILES_DISPLAY_COUNT -1)):
+                       lines_to_print.append(" ".ljust(term_width))
+
 
                 lines_to_print.append("-" * term_width)
                 lines_to_print.append("(Press Ctrl+C to stop)".center(term_width))
@@ -852,294 +600,214 @@ class CS16BandwidthTester:
                 time.sleep(1)
 
             # Wait before next update
-            sleep_interval = 0.1; sleep_end = time.time() + UI_UPDATE_INTERVAL
+            sleep_interval = 0.1
+            sleep_end = time.time() + UI_UPDATE_INTERVAL
             while time.time() < sleep_end:
-                if self._stop_event.wait(timeout=sleep_interval): break
+                 if self._stop_event.wait(timeout=sleep_interval): break
             if self._stop_event.is_set(): break
 
         if self.verbose: logger.debug("Realtime display thread finished.")
         sys.stdout.write(CURSOR_TO_HOME + CLEAR_SCREEN_FROM_CURSOR)
         sys.stdout.flush()
 
+
     def start_test(self):
-        # (Updated initialization)
         if self.active:
             logger.warning("Test is already running.")
             return
 
-        logger.info("="*30 + " Starting Test " + "="*30)
-        logger.info(f"Storage Directory: {self.storage_dir}")
-        logger.info(f"Download Log File: {self.download_log_filepath}")
-        if self.manual_fastdl_url:
-             logger.info(f"Manual FastDL URL provided: {self.manual_fastdl_url}")
-        else:
-             logger.info("Attempting FastDL URL discovery via server rules.")
-
+        logger.info("="*30 + " Starting REAL Download Test " + "="*30)
         self.active = True
         self._stop_event.clear()
         self.start_time = time.time()
         self.end_time = 0
 
         # Reset counters
-        self.bytes_sent = 0; self.bytes_received = 0; self.bandwidth_log_points = []
-        self.initial_connection_failures = 0; self.runtime_connection_issues = 0
+        self.bytes_sent_http_requests = 0; self.bytes_received_http = 0
+        self.files_downloaded_count = 0; self.files_failed_count = 0
         self.active_workers_count = 0; self.server_status_log = []
-        self.asset_downloads = {k: 0 for k in DOWNLOAD_SIZES}; self.asset_bandwidth = {k: 0 for k in DOWNLOAD_SIZES}
-        self.downloaded_files = []; self.last_downloaded_files.clear()
-        self.http_download_attempts = 0; self.http_download_successes = 0; self.http_download_failures = 0
-        self.simulated_downloads_run = 0
-
-        # Reset server info state
+        self.last_download_activity.clear(); self.bandwidth_log_points = []
         self.server_status = "MONITORING_DISABLED" if self.no_server_monitor else "UNKNOWN";
-        self.server_last_seen = 0; self.server_info = None; self.server_rules = None
-        self.discovered_fastdl_url = None
-        self.active_fastdl_url = self.manual_fastdl_url # Reset active URL
+        self.server_last_seen = 0; self.server_info = None; self.current_map_file = None
 
-        self.connections = []; self.threads = []
 
-        # Start Monitor Thread (if enabled)
+        self.threads = []
+
+        # Start UDP server monitor first (to get map name)
         if not self.no_server_monitor and self.server_query:
             self.server_info_thread = threading.Thread(target=self._update_server_info, name="ServerMon", daemon=True)
             self.server_info_thread.start()
             self.threads.append(self.server_info_thread)
-            # Give monitor a moment to potentially get initial info/URL
-            time.sleep(1.0)
+            # Give it a moment to potentially get the first map name
+            time.sleep(0.5)
 
-        # Start Display Thread
+        # Start display thread
         self.display_thread = threading.Thread(target=self._display_realtime_stats, name="Display", daemon=True)
         self.display_thread.start()
         self.threads.append(self.display_thread)
 
-        # Start Worker Threads
-        logger.info(f"Attempting to establish {self.num_connections} worker connections...")
-        initial_success = 0
+        # Start worker threads
+        logger.info(f"Starting {self.num_connections} download workers...")
         for i in range(self.num_connections):
             if self._stop_event.is_set(): break
-            conn_info = self._create_connection(i + 1) # Creates UDP socket if possible
-            # Note: Connection info doesn't guarantee reachability, workers handle actual comms
-            if conn_info: # Success here just means structure created
-                worker_thread = threading.Thread(target=self._connection_worker, args=(conn_info,), name=f"Worker-{i+1}", daemon=True)
-                self.connections.append(conn_info)
-                worker_thread.start()
-                self.threads.append(worker_thread)
-                initial_success += 1
-            else: # Failure likely means UDP socket creation failed
-                self._increment_counter("initial_connection_failures")
-            if self.num_connections > 20 and (i + 1) % 20 == 0: time.sleep(0.05) # Slow down worker start slightly
+            worker_thread = threading.Thread(target=self._connection_worker, args=(i + 1,), name=f"Worker-{i+1}", daemon=True)
+            # No initial connection check needed like UDP sockets
+            worker_thread.start()
+            self.threads.append(worker_thread)
+            if self.num_connections > 20 and (i + 1) % 20 == 0: time.sleep(0.05) # Small stagger
 
-        logger.info(f"Successfully started {initial_success} workers initially. {self.initial_connection_failures} failed (likely UDP socket issue).")
+        logger.info(f"All {self.num_connections} workers launched.")
 
-        if initial_success == 0 and self.num_connections > 0:
-            logger.error("FATAL: No worker threads could be started. Stopping test.")
-            self.stop_test()
-            return
-
-        # --- Main Test Loop (Wait for duration or Ctrl+C) ---
         try:
             if self.continuous_mode:
-                logger.info("Running in continuous mode. Press Ctrl+C to stop.")
-                self._stop_event.wait() # Wait indefinitely until stop_test sets the event
+                self._stop_event.wait() # Wait indefinitely until stop signal
                 logger.info("Stop event received, finishing...")
             else:
-                logger.info(f"Running timed test for {self.test_duration} seconds. Press Ctrl+C to stop early.")
                 stopped_early = self._stop_event.wait(timeout=self.test_duration)
                 if stopped_early:
                     logger.info("Test stopped early via signal.")
                 else:
                     logger.info("Test duration reached.")
-                    self.stop_test() # Stop naturally after duration
+                    self.stop_test()
 
-        except KeyboardInterrupt: # Should be caught by signal handler, but as fallback
-              logger.warning("KeyboardInterrupt caught in main loop. Stopping.")
-              if not self._stop_event.is_set():
-                   self.stop_test()
         except Exception as e:
-             logger.error(f"Error in main test execution: {e}", exc_info=self.verbose)
-             self.stop_test()
+             logger.error(f"Error in main test execution: {e}")
+             self.stop_test() # Ensure cleanup on error
 
     def stop_test(self):
-        # (Stop logic remains mostly the same)
         if not self.active: return
-        if self._stop_event.is_set(): # Prevent double stops
-            logger.info("Stop process already initiated.")
-            return
 
         logger.info("Stopping test...")
-        self.active = False # Set inactive flag first
-        self._stop_event.set() # Signal all threads
+        self.active = False
+        self._stop_event.set()
         self.end_time = time.time() if self.start_time > 0 else time.time()
 
         logger.info("Waiting for threads to complete...")
-        join_timeout = 5.0 # Increase timeout slightly for potential file cleanup
+        join_timeout = 5.0 # Increase timeout slightly as downloads might take time
 
-        threads_to_join = self.threads[:] # Copy list
+        threads_to_join = self.threads[:]
         for thread in threads_to_join:
-            if thread is threading.current_thread(): continue
-            if thread.is_alive():
+             if thread is threading.current_thread(): continue
+             if thread.is_alive():
                 try:
                     if self.verbose: logger.debug(f"Joining thread: {thread.name}...")
                     thread.join(join_timeout)
-                    if thread.is_alive():
-                        logger.warning(f"Thread {thread.name} did not stop within timeout {join_timeout}s.")
-                except Exception as e:
-                    logger.warning(f"Error joining thread {thread.name}: {e}")
+                    if thread.is_alive(): logger.warning(f"Thread {thread.name} did not stop within timeout.")
+                except Exception as e: logger.warning(f"Error joining thread {thread.name}: {e}")
 
         logger.info("All threads processed.")
 
         if self.server_query: self.server_query.close()
+        self.session.close() # Close the requests session
+        if download_log_file:
+            try:
+                 download_log_file.write(f"--- Log End: {datetime.now().isoformat()} ---\n")
+                 download_log_file.close()
+            except: pass # Ignore errors closing log
 
-        # Close download log file handler
-        if download_logger:
-            for handler in download_logger.handlers[:]:
-                if isinstance(handler, logging.FileHandler):
-                    handler.close()
-                    download_logger.removeHandler(handler)
-            download_logger.info("--- Download Log Ended ---") # Log end marker (won't go to file now)
-
-
-        # Final report generation
+        # Final Report
         final_elapsed = self.end_time - self.start_time if self.start_time > 0 else 0
         self._generate_final_report(final_elapsed)
-        self._save_detailed_report_json(final_elapsed) # Save JSON (needs update)
+        self._save_detailed_report_json(final_elapsed) # Save JSON report
 
-        logger.info(f"Test finished. Check {self.download_log_filepath} for download details.")
+        logger.info("Test finished.")
+
 
     def _generate_final_report(self, duration):
-        # (Updated for new stats)
-        print("\n" + "="*30 + " Test Results Summary " + "="*30)
+        print("\n" + "="*30 + " REAL Download Test Results " + "="*30)
         duration = max(duration, 0.01)
 
         with self.lock:
-            bytes_sent = self.bytes_sent; bytes_received = self.bytes_received
-            http_attempts = self.http_download_attempts
-            http_success = self.http_download_successes
-            http_fails = self.http_download_failures
-            sim_runs = self.simulated_downloads_run
-            runtime_issues = self.runtime_connection_issues; initial_fails = self.initial_connection_failures
+            bytes_received = self.bytes_received_http
+            files_ok = self.files_downloaded_count
+            files_err = self.files_failed_count
+            # Get final server status info if available
             final_server_status = self.server_status
-            final_server_info = self.server_info.copy() if self.server_info else None
+            final_map = self.current_map_file or "UNKNOWN"
             server_log = self.server_status_log[:]
-            final_active_url = self.active_fastdl_url
 
-        sent_mb = bytes_sent / (1024*1024); received_mb = bytes_received / (1024*1024); total_mb = sent_mb + received_mb
-        avg_rate_mbs = total_mb / duration; avg_send_mbs = sent_mb / duration; avg_recv_mbs = received_mb / duration
+        received_mb = bytes_received / (1024*1024)
+        avg_recv_mbs = received_mb / duration
 
-        server_name = "N/A"; server_map = "N/A"; avg_ping = -1; min_ping = -1; max_ping = -1
+        avg_ping = -1; min_ping = -1; max_ping = -1
         if not self.no_server_monitor:
-            # Logic to get last known name/map (same as before)
-            last_valid_log = next((log for log in reversed(server_log) if log.get('status') in ['ONLINE', 'ISSUES'] and log.get('name') not in [None,'N/A','']), None)
-            if last_valid_log: server_name = last_valid_log.get('name', 'N/A'); server_map = last_valid_log.get('map', 'N/A')
-            elif final_server_info: server_name = final_server_info.get('name', 'N/A'); server_map = final_server_info.get('map', 'N/A')
-            # Ping calculation (same as before)
-            pings = [log['ping'] for log in server_log if log.get('ping', -1) >= 0]
-            if pings: avg_ping = sum(pings)/len(pings); min_ping = min(pings); max_ping = max(pings)
+             pings = [log['ping'] for log in server_log if log.get('ping', -1) >= 0]
+             if pings: avg_ping = sum(pings)/len(pings); min_ping = min(pings); max_ping = max(pings)
+
 
         print(f"[Test Overview]")
-        print(f" Target:          {self.server_ip}:{self.server_port}")
+        print(f" Game Server:     {self.server_ip}:{self.server_port}")
+        print(f" FastDL URL:      {self.fastdl_base_url}")
         print(f" Duration:        {duration:.2f}s")
         print(f" Mode:            {'Continuous (Stopped)' if self.continuous_mode else 'Timed'}")
-        print(f" Connections:     {self.num_connections} (Target)")
-        print(f" Initial Fails:   {initial_fails}")
-        print(f" Runtime Issues:  {runtime_issues}")
+        print(f" Workers:         {self.num_connections}")
+        print(f" Delete Files:    {self.delete_after_download}")
 
-        print("\n[Server & FastDL Status]")
-        if self.no_server_monitor: print(" Server Monitoring: Disabled")
+        print("\n[Download Results (HTTP)]")
+        print(f" Files OK:        {files_ok}")
+        print(f" Files Failed:    {files_err} (Check download_attempts.log)")
+        print(f" Total Received:  {received_mb:.2f} MB")
+        print(f" Avg Recv Rate:   {avg_recv_mbs:.2f} MB/s")
+
+        print("\n[Server Status (UDP Query)]")
+        if self.no_server_monitor:
+            print(" Monitoring:      Disabled")
         else:
             print(f" Final Status:    {final_server_status}")
-            print(f" Last Name:       {server_name}")
-            print(f" Last Map:        {server_map}")
+            print(f" Last Known Map:  {final_map}")
             print(f" Avg Ping:        {avg_ping:.1f} ms" if avg_ping != -1 else "N/A")
             print(f" Ping Min/Max:    {min_ping} / {max_ping} ms" if min_ping != -1 else "N/A")
-        print(f" Final FastDL URL:{final_active_url if final_active_url else 'None / Not Found'}")
-
-        print("\n[Bandwidth Usage (Actual/Sim)]")
-        print(f" Total Sent (UDP):{sent_mb:>8.2f} MB")
-        print(f" Total Recv(Mixed):{received_mb:>8.2f} MB")
-        print(f" Total Data:      {total_mb:>8.2f} MB")
-        print(f" Avg Send Rate:   {avg_send_mbs:>8.2f} MB/s")
-        print(f" Avg Recv Rate:   {avg_recv_mbs:>8.2f} MB/s")
-        print(f" Avg Total Rate:  {avg_rate_mbs:>8.2f} MB/s")
-
-        print("\n[Download Activity]")
-        print(f" HTTP Attempts:   {http_attempts}")
-        print(f" HTTP Successes:  {http_success}")
-        print(f" HTTP Failures:   {http_fails}")
-        print(f" Simulations Run: {sim_runs}")
-        print(f" (See {DOWNLOAD_LOG_FILENAME} for details)")
 
         print("="*60)
 
-    def _save_detailed_report_json(self, duration, initial_fails=None, runtime_issues=None):
-         # (Needs significant update to reflect new stats)
+    def _save_detailed_report_json(self, duration):
+         # Save a JSON report similar to before, but with real download data
          with self.lock:
             duration = max(0.01, duration)
-            sent_mb = self.bytes_sent / (1024*1024)
-            received_mb = self.bytes_received / (1024*1024) # Mixed recv
-            total_mb = sent_mb + received_mb
-            avg_rate_mbs = total_mb / duration
-            http_attempts = self.http_download_attempts
-            http_success = self.http_download_successes
-            http_fails = self.http_download_failures
-            sim_runs = self.simulated_downloads_run
+            received_mb = self.bytes_received_http / (1024*1024)
+            avg_recv_mbs = received_mb / duration
+            files_ok = self.files_downloaded_count
+            files_err = self.files_failed_count
             server_log = self.server_status_log[:]
-            initial_fails = self.initial_connection_failures if initial_fails is None else initial_fails
-            runtime_issues = self.runtime_connection_issues if runtime_issues is None else runtime_issues
-            final_active_url = self.active_fastdl_url
-            manual_url = self.manual_fastdl_url
-            discovered_url = self.discovered_fastdl_url
 
          report_data = {
             "test_info": {
-                "target_server": f"{self.server_ip}:{self.server_port}",
+                "test_type": "REAL_HTTP_DOWNLOAD",
+                "game_server": f"{self.server_ip}:{self.server_port}",
+                "fastdl_url": self.fastdl_base_url,
                 "timestamp_utc": datetime.utcnow().isoformat() + "Z",
                 "duration_seconds": round(duration, 2),
-                "configured_connections": self.num_connections,
-                "initial_connection_failures": initial_fails,
-                "runtime_connection_issues": runtime_issues,
-                "udp_simulation_delay_config_s": self.download_delay, # Renamed for clarity
+                "configured_workers": self.num_connections,
+                "delete_files_after_download": self.delete_after_download,
                 "mode": "Continuous" if self.continuous_mode else "Timed",
-                "server_monitoring": not self.no_server_monitor,
+                "server_udp_monitoring": not self.no_server_monitor,
                 "verbose_logging": self.verbose,
-                "fastdl_info": {
-                     "manual_url_provided": manual_url,
-                     "last_discovered_url": discovered_url,
-                     "last_active_url": final_active_url,
-                     "http_timeout_s": HTTP_TIMEOUT,
-                }
             },
-            "bandwidth_summary": {
-                "sent_udp_mb": round(sent_mb, 3),
-                "received_mixed_mb": round(received_mb, 3),
-                "total_mb": round(total_mb, 3),
-                "avg_total_rate_mbs": round(avg_rate_mbs, 3),
+            "download_summary": {
+                "files_downloaded_successfully": files_ok,
+                "files_failed_or_skipped": files_err,
+                "total_received_mb": round(received_mb, 3),
+                "avg_receive_rate_mbs": round(avg_recv_mbs, 3),
                 "start_time_unix": self.start_time,
                 "end_time_unix": self.end_time,
                 "bandwidth_log_points_sec_mb": [(round(t, 2), round(mb, 3)) for t, mb in self.bandwidth_log_points],
             },
-            "download_activity_summary": {
-                "http_attempts": http_attempts,
-                "http_successes": http_success,
-                "http_failures": http_fails,
-                "udp_simulations_run": sim_runs,
-                # Note: Detailed per-file logs are in download_log.txt
-            },
-            "server_status_log": server_log # Contains periodic server info
+             "server_status_log": server_log # Keep UDP query log for context
          }
 
          ts = int(time.time())
-         report_filename = f"cs_bw_report_{self.server_ip.replace('.', '_')}_{self.server_port}_{ts}.json"
+         report_filename = f"cs_real_dl_report_{self.server_ip.replace('.', '_')}_{self.server_port}_{ts}.json"
          report_filepath = os.path.join(self.storage_dir, report_filename)
 
          try:
-            with open(report_filepath, 'w') as f:
-                json.dump(report_data, f, indent=2)
-            logger.info(f"Detailed test report saved to: {report_filepath}")
+            with open(report_filepath, 'w') as f: json.dump(report_data, f, indent=2)
+            logger.info(f"Detailed JSON test report saved to: {report_filepath}")
          except Exception as e:
-            logger.error(f"Failed to save detailed report '{report_filepath}': {e}")
+            logger.error(f"Failed to save detailed JSON report '{report_filepath}': {e}")
 
 
 # ==============================================================
-# Signal Handling (Same as before)
+# Signal Handling
 # ==============================================================
 def signal_handler(sig, frame):
     global tester_instance
@@ -1147,79 +815,74 @@ def signal_handler(sig, frame):
         if not tester_instance._stop_event.is_set():
             print('\n')
             logger.warning("Ctrl+C received! Initiating graceful shutdown...")
-            # Run stop_test in a thread to prevent blocking the signal handler
+            # Run stop_test in a thread to prevent potential blocking in signal handler
             threading.Thread(target=tester_instance.stop_test, daemon=True).start()
     else:
         print('\nCtrl+C received, but no active test found or test already stopping. Exiting.')
+        if download_log_file: # Try to close log file on immediate exit too
+             try: download_log_file.close()
+             except: pass
         sys.exit(0)
 
 # ==============================================================
-# Main execution block (Added arguments)
+# Main execution block
 # ==============================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="CS 1.6 Server Bandwidth Testing Tool (HTTP/UDP CLI Version)",
+        description="CS 1.6 Server REAL Bandwidth Testing Tool (HTTP FastDL)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("server_ip", help="IP address or hostname of the CS 1.6 server.")
-    parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT, help="Server UDP query port.")
-    parser.add_argument("-c", "--connections", type=int, default=10, help="Number of concurrent workers (use lower values for HTTP testing).") # Reduced default
+    # --- Essential Arguments ---
+    parser.add_argument("server_ip", help="IP address or hostname of the CS 1.6 GAME server (for UDP queries).")
+    parser.add_argument("--fastdl-url", required=True, help="Base URL of the server's FastDL repository (e.g., http://my.fastdl.com/cs/). REQUIRED.")
+
+    # --- Optional Arguments ---
+    parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT, help="GAME server UDP port (for queries).")
+    parser.add_argument("-c", "--connections", type=int, default=10, help="Number of concurrent download workers.")
     parser.add_argument("-d", "--duration", type=int, default=60, help="Duration of timed test in seconds.")
-    parser.add_argument("-dl", "--delay", type=float, default=0.0, help="Simulated delay factor for UDP simulation fallback (0 = no delay).") # Changed default
+    parser.add_argument("--storage-dir", default="cs_downloads", help="Directory to save downloaded files and reports.")
+    parser.add_argument("--file-list", help="Path to a text file containing relative file paths to download (one per line, e.g., maps/de_dust2.bsp).")
+    parser.add_argument("--delete-after-download", action="store_true", help="Delete files locally immediately after successful download.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging.")
     parser.add_argument("-cont", "--continuous", action="store_true", help="Run continuously until stopped (Ctrl+C).")
-    parser.add_argument("--no-server-monitor", action="store_true", help="Disable querying server status/rules.")
-    parser.add_argument("--storage-dir", default="cs_test_reports", help="Directory for JSON report and download log files.")
-    parser.add_argument("--fastdl-url", default=None, help="Manually specify the base HTTP FastDL URL (e.g., http://my.fastdl.com/cstrike/). Overrides discovered URL.")
-    # parser.add_argument("--download-maps-only", action="store_true", help="Currently only map downloads are implemented.") # Not needed as only maps implemented
-
-    # --- Dependency Check ---
-    try:
-        import requests
-    except ImportError:
-        print("Error: The 'requests' library is required for HTTP downloads.")
-        print("Please install it using: pip install requests")
-        sys.exit(1)
-
+    parser.add_argument("--no-server-monitor", action="store_true", help="Disable querying game server status via UDP (will not get current map automatically).")
+    parser.add_argument("--download-log", default="download_attempts.log", help="Filename for logging individual download attempts.")
 
     args = parser.parse_args()
 
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-        logger.info("Verbose logging enabled.")
-    else:
-        logger.setLevel(logging.INFO)
+    if args.verbose: logger.setLevel(logging.DEBUG)
+    else: logger.setLevel(logging.INFO)
 
-    # --- WARNING --- (Keep the warning)
+    # Setup dedicated download logger
+    setup_download_logger(os.path.join(args.storage_dir, args.download_log)) # Place log in storage dir
+
     logger.warning("="*70)
     logger.warning("⚠️ IMPORTANT RESPONSIBILITY NOTICE ⚠️")
-    logger.warning("You are SOLELY responsible for the use of this tool.")
-    logger.warning("Performing actual file downloads (HTTP mode) can place significant load")
-    logger.warning("on the target server. Obtain EXPLICIT PERMISSION before testing")
-    logger.warning("any server you DO NOT own or operate.")
-    logger.warning("Misuse can negatively impact server performance, incur bandwidth costs,")
-    logger.warning("and is unethical and potentially illegal. Use responsibly.")
+    logger.warning("This tool performs REAL file downloads from the specified FastDL URL.")
+    logger.warning("This WILL consume bandwidth and resources on the target FastDL host.")
+    logger.warning("Ensure you have EXPLICIT PERMISSION before testing any server/FastDL.")
+    logger.warning("Misuse can negatively impact services and is unethical. Use responsibly.")
     logger.warning("="*70)
-    if args.fastdl_url or not args.no_server_monitor:
-        logger.warning("HTTP Download mode potentially enabled. Ensure you have permission!")
-    else:
-        logger.warning("Running in UDP Simulation mode only (no FastDL URL specified and monitoring disabled).")
-
-    time.sleep(2.5) # Longer pause if HTTP might be used
+    time.sleep(2.0)
 
     try:
-        tester_instance = CS16BandwidthTester(
+        # Ensure storage dir exists before initializing tester which might use it
+        if not os.path.exists(args.storage_dir):
+            try: os.makedirs(args.storage_dir); logger.info(f"Created base directory: {args.storage_dir}")
+            except OSError as e: logger.error(f"Cannot create storage directory '{args.storage_dir}': {e}. Reports/logs may fail.")
+
+        tester_instance = CS16RealDownloader(
             server_ip=args.server_ip,
             server_port=args.port,
+            fastdl_url=args.fastdl_url,
             num_connections=args.connections,
             test_duration=args.duration,
-            download_delay=args.delay,
-            verbose=args.verbose,
             storage_dir=args.storage_dir,
             continuous_mode=args.continuous,
             no_server_monitor=args.no_server_monitor,
-            fastdl_url=args.fastdl_url,
-            download_maps_only=True # Hardcoded as only maps are implemented
+            delete_after_download=args.delete_after_download,
+            verbose=args.verbose,
+            file_list_path=args.file_list
         )
 
         signal.signal(signal.SIGINT, signal_handler)
@@ -1227,11 +890,20 @@ if __name__ == "__main__":
 
         tester_instance.start_test()
 
-        # Main thread waits here implicitly because start_test blocks until completion/stop
-
-        logger.info("Main thread exiting.")
+        # Main thread now waits implicitly if start_test blocks (timed mode)
+        # or waits on the stop_event (continuous mode) which is handled internally.
+        logger.info("Main thread finished waiting for test completion.")
         sys.exit(0)
 
+    except ValueError as e:
+         # Catch specific init errors like missing URL
+         logger.error(f"Configuration Error: {e}")
+         sys.exit(1)
     except Exception as e:
-        logger.critical(f"A critical error occurred in the main script: {type(e).__name__} - {str(e)}", exc_info=True)
+        logger.error(f"An critical error occurred in the main script: {type(e).__name__} - {str(e)}", exc_info=True)
         sys.exit(1)
+    finally:
+        # Ensure log file is closed even if main crashes early
+        if download_log_file and not download_log_file.closed:
+            try: download_log_file.close()
+            except: pass
