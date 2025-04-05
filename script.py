@@ -2524,8 +2524,10 @@ class CS16BandwidthTester:
             threading.Thread(target=self.stop_test, daemon=True).start()
             return # Exit start_test method
 
-        # --- Main Test Loop (Wait for Duration or Stop Signal) ---
-        logger.info(f"Test running... Mode: {run_mode}")
+# --- Main Test Loop (Wait for Duration or Stop Signal) ---
+        # Define run_mode based on instance attributes before logging
+        run_mode = "Continuous" if self.continuous_mode else f"Timed ({self.test_duration}s)"
+        logger.info(f"Test running... Mode: {run_mode}") # <--- Now run_mode is defined
         try:
             if self.continuous_mode:
                 # In continuous mode, wait indefinitely until stop_event is set
