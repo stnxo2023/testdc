@@ -974,7 +974,7 @@ class UDPFileDownloader:
                             # Keep waiting for more fragments until the main DOWNLOAD_TIMEOUT expires
 
 
-                    except socket.error as sock_err:
+except socket.error as sock_err:
                         download_logger.error(f"Socket error during recv: {sock_err}")
                         logger.error(f"Socket error receiving data for {file_id}: {sock_err}")
                         return False, self.bytes_received # Assume fatal for this download attempt
